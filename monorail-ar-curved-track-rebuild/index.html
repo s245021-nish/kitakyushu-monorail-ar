@@ -1,0 +1,274 @@
+<!doctype html>
+<html lang="ja">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>北九州モノレール AR</title>
+<style>
+:root{font-family:system-ui,sans-serif;color:#eef8ff;background:#081a2c;color-scheme:dark}*{box-sizing:border-box}body{margin:0}main{max-width:960px;margin:auto;padding:clamp(18px,4vw,42px)}header{display:flex;align-items:center;gap:13px;margin-bottom:20px}.icon{display:grid;place-items:center;width:46px;height:46px;border-radius:12px;background:#b9eaff;color:#103963;font-size:25px}h1{font-size:clamp(24px,5vw,38px);letter-spacing:-.04em;margin:0}.stage{position:relative;overflow:hidden;border-radius:20px;background:#153953;aspect-ratio:16/10;border:1px solid #39617a}video,canvas{position:absolute;width:100%;height:100%;object-fit:cover;inset:0}video{visibility:hidden}#status{position:absolute;bottom:12px;left:12px;right:12px;margin:0;padding:9px 13px;border-radius:11px;background:#071b2de8;font-size:14px;width:fit-content;max-width:calc(100% - 24px)}.actions{display:flex;flex-wrap:wrap;gap:8px;margin:14px 0}button,a.action{border:1px solid #537e9c;background:#193954;border-radius:10px;padding:10px 15px;font:inherit;color:inherit;text-decoration:none;cursor:pointer}button.primary{background:#a8e5ff;color:#09243b;border-color:transparent;font-weight:700}button:disabled{opacity:.5;cursor:default}details{border-top:1px solid #31536b;padding:14px 0;color:#c2d7e8}summary{cursor:pointer}p{line-height:1.65}#marker{position:static;display:block;width:min(330px,100%);height:auto;aspect-ratio:1;background:white;image-rendering:pixelated;margin:14px 0}[hidden]{display:none!important}@media(max-width:530px){.stage{aspect-ratio:4/5}}
+#version{position:absolute;right:10px;top:10px;padding:4px 7px;border-radius:6px;background:#081a2cee;color:#e1f4ff;font-size:11px;pointer-events:none}
+@media print{body{background:white;color:black}header,.stage,.actions,summary,details p,details a{display:none}#marker{width:75mm;height:75mm}}
+</style>
+<main>
+<header><span class="icon" aria-hidden="true">🚝</span><h1>北九州モノレール AR</h1></header>
+<section class="stage" aria-label="AR表示"><video playsinline muted></video><canvas id="scene"></canvas><small id="version">AR v4 · CURVE</small><p id="status" role="status" aria-live="polite">プレビュー · カメラなしで動きを確認できます</p></section>
+<div class="actions"><button class="primary" id="start">ARカメラを開く</button><button id="demo">プレビューを再生</button><button id="replay" hidden>もう一度発車</button></div>
+<details id="markerDetails"><summary>テスト用QRマーカーを表示</summary><p>PCでこのQRを表示し、iPhoneのSafariで同じサイトを開いて「ARカメラを開く」を押してください。白い余白までカメラに映します。</p><img id="marker" src="assets/monorail-ar-marker.png" width="528" height="528" alt="北九州モノレールAR用の白黒QRコード"><a class="action" id="save" href="assets/monorail-ar-marker.png" download="monorail-ar-marker.png">QR画像を保存</a></details>
+</main>
+<script src="assets/jsQR.js" defer></script>
+<script>
+const $ = s => document.querySelector(s);
+const video = $('video'), canvas = $('#scene'), ctx = canvas.getContext('2d');
+const stage = $('.stage'), sample = document.createElement('canvas');
+const scan = sample.getContext('2d',{willReadFrequently:true});
+let width, height, stream, mode = 'demo', modeRequest = 0, frame = 0;
+const markerPayload = 'KITAKYUSHU-MONORAIL-AR';
+const trackingGraceMs = 450;
+let pose, lastSeen = 0, lastScan = 0, depart = 0, demoStart = performance.now();
+const status = message => { if ($('#status').textContent !== message) $('#status').textContent = message; };
+const clamp = (v,a,b) => Math.max(a,Math.min(b,v));
+const mix = (a,b,t) => a+(b-a)*t;
+const smooth = (a,b,x) => {const t=clamp((x-a)/(b-a),0,1);return t*t*(3-2*t);};
+
+function resize(){
+  const box=stage.getBoundingClientRect(), d=Math.min(devicePixelRatio||1,2);
+  const w=Math.round(box.width*d), h=Math.round(box.height*d);
+  if (width===w && height===h) return;
+  width=canvas.width=w; height=canvas.height=h;
+  pose=null; lastSeen=0;
+}
+new ResizeObserver(resize).observe(stage);
+resize();
+
+function polygon(points, fill, stroke){
+  if(points.some(p=>!p)) return;
+  ctx.beginPath(); points.forEach(([x,y],i)=>i?ctx.lineTo(x,y):ctx.moveTo(x,y));ctx.closePath();
+  ctx.fillStyle=fill;ctx.fill();
+  if(stroke){ctx.strokeStyle=stroke;ctx.lineWidth=1;ctx.stroke();}
+}
+function homography(corners){
+  const [[x0,y0],[x1,y1],[x2,y2],[x3,y3]]=corners;
+  const dx1=x1-x2, dx2=x3-x2, dx3=x0-x1+x2-x3;
+  const dy1=y1-y2, dy2=y3-y2, dy3=y0-y1+y2-y3;
+  const det=dx1*dy2-dx2*dy1;
+  if(Math.abs(det)<1)return;
+  const g=(dx3*dy2-dx2*dy3)/det, h=(dx1*dy3-dx3*dy1)/det;
+  const a=x1-x0+g*x1,b=x3-x0+h*x3,d=y1-y0+g*y1,e=y3-y0+h*y3;
+  return (x,y)=>{
+    const depth=1+g*x+h*y;
+    if(depth<.16)return null;
+    return [(a*x+b*y+x0)/depth,(d*x+e*y+y0)/depth];
+  };
+}
+
+// Coordinates are relative to the QR's center. A shared presentation projection
+// keeps the broad side and navy beam visible even with a head-on camera.
+const trackControls=[[1.09,-.55],[.66,.025],[-.12,.19],[-1.19,.47]];
+const trackSamples=[];
+const carPitch=.30;
+for(let i=0;i<=96;i++){
+  const t=i/96, u=1-t;
+  const weights=[u*u*u,3*u*u*t,3*u*t*t,t*t*t];
+  const point=[0,1].map(axis=>trackControls.reduce((sum,p,j)=>sum+p[axis]*weights[j],0));
+  const scale=.48+.92*t*t;
+  const last=trackSamples[i-1];
+  const distance=last?last.distance+Math.hypot(point[0]-last.x,point[1]-last.y)/((scale+last.scale)/2):0;
+  trackSamples.push({x:point[0],y:point[1],scale,distance});
+}
+const trackLength=trackSamples.at(-1).distance;
+
+function sampleTrack(distance){
+  let index=1;
+  while(index<trackSamples.length-1&&trackSamples[index].distance<distance)index++;
+  const a=trackSamples[index-1],b=trackSamples[index];
+  const t=clamp((distance-a.distance)/(b.distance-a.distance),0,1);
+  return {x:mix(a.x,b.x,t),y:mix(a.y,b.y,t),scale:mix(a.scale,b.scale,t)};
+}
+
+function drawDeparture(corners,markerProject,time){
+  const center=markerProject(.5,.5);
+  if(!center)return;
+  const [tl,tr,br,bl]=corners;
+  const dx=(tr[0]-tl[0]+br[0]-bl[0])/2;
+  const dy=(tr[1]-tl[1]+br[1]-bl[1])/2;
+  const edge=Math.hypot(dx,dy);
+  if(edge<1)return;
+  const vertical=(Math.hypot(bl[0]-tl[0],bl[1]-tl[1])+Math.hypot(br[0]-tr[0],br[1]-tr[1]))/2;
+  const size=Math.min(Math.sqrt(edge*vertical)*1.08,width*.37,height*.44);
+  const cos=dx/edge,sin=dy/edge;
+  const screen=([x,y])=>[center[0]+size*(x*cos-y*sin),center[1]+size*(x*sin+y*cos)];
+  const draw=(points,color)=>polygon(points.map(screen),color);
+  const progress=clamp(time/3.55,0,1);
+  const lead=mix(carPitch*3+.11,trackLength-.14,progress*(.56+.44*progress));
+  ctx.save();
+  ctx.globalAlpha=1-smooth(.90,1,progress);
+  const edgeAt=(p,offset)=>[p.x,p.y+offset*p.scale];
+  draw([...trackSamples.map(p=>edgeAt(p,-.028)),...trackSamples.slice().reverse().map(p=>edgeAt(p,.027))],'#466579');
+  draw([...trackSamples.map(p=>edgeAt(p,.027)),...trackSamples.slice().reverse().map(p=>edgeAt(p,.133))],'#142e40');
+  draw([...trackSamples.map(p=>edgeAt(p,.028)),...trackSamples.slice().reverse().map(p=>edgeAt(p,.043))],'#274d63');
+
+  for(let car=3;car>=0;car--){
+    const distance=lead-car*carPitch;
+    const rear=sampleTrack(distance-.132);
+    const front=sampleTrack(distance+.132);
+    const center=sampleTrack(distance);
+    const height=center.scale*.38;
+    // The body axis follows the chord between its two bogies. The front fascia
+    // uses a short screen-space rim to preserve its silhouette at small sizes.
+    const side=(along,up)=>[mix(rear.x,front.x,along),mix(rear.y,front.y,along)-up*height];
+    const shape=(points,color)=>draw(points.map(([a,b])=>side(a,b)),color);
+    const panel=(a,b,low,high,color)=>shape([[a,low],[b,low],[b,high],[a,high]],color);
+    const rim=(point)=>[point[0]-.047*front.scale,point[1]-.035*front.scale];
+    const roofRear=side(.025,1),roofFront=side(.962,1);
+    if(car>0){
+      const coupled=sampleTrack(distance+carPitch-.134);
+      draw([[front.x,front.y-.031],[coupled.x,coupled.y-.031],[coupled.x,coupled.y-.005],[front.x,front.y-.005]],'#132834');
+    }
+    draw([roofRear,roofFront,rim(roofFront),rim(roofRear)],'#b3c5ca');
+    shape([[0,.12],[.04,0],[.91,0],[1,.12],[1,.89],[.962,1],[.025,1],[0,.88]],'#f3e9cf');
+    panel(.015,.98,.11,.37,'#0769b6');
+    panel(.025,.97,.08,.115,'#9dafb5');
+    panel(.025,.97,.365,.405,'#eaf2ed');
+    for(let window=0;window<3;window++){
+      const x=.06+window*.31;
+      panel(x,x+.264,.48,.84,'#102d40');
+      panel(x+.012,x+.25,.785,.823,'#426779');
+    }
+    if(car===0){
+      const nose=(across,up)=>{
+        const p=side(1,up);
+        const outer=rim(p);
+        return [mix(p[0],outer[0],across),mix(p[1],outer[1],across)];
+      };
+      const cab=(a,b,low,high,color)=>draw([nose(a,low),nose(b,low),nose(b,high),nose(a,high)],color);
+      cab(0,1,.12,.90,'#dddbc8');
+      cab(.08,.93,.48,.85,'#102b3c');
+      cab(0,1,.14,.38,'#075eaa');
+      cab(.10,.33,.21,.30,'#fff9d2');
+      cab(.66,.89,.21,.30,'#fff9d2');
+    }
+  }
+  ctx.restore();
+}
+
+function demo(t){
+  const bg=ctx.createLinearGradient(0,0,width,height);
+  bg.addColorStop(0,'#0a2339');bg.addColorStop(1,'#276784');
+  ctx.fillStyle=bg;ctx.fillRect(0,0,width,height);
+  const size=Math.min(width*.49,height*.48), x=width*.47,y=height*.51;
+  const corners=[[x-size*.61,y-size*.27],[x+size*.36,y-size*.47],[x+size*.68,y+size*.23],[x-size*.48,y+size*.49]];
+  const p=homography(corners);
+  polygon(corners,'#e8f3f6','#7cd9ff');
+  if(p){
+    matrix.forEach((row,iy)=>[...row].forEach((bit,ix)=>{
+      if(bit!=='1')return;
+      const n=matrix.length,a=(ix+2)/(n+4),b=(iy+2)/(n+4),q=1/(n+4);
+      polygon([p(a,b,0),p(a+q,b,0),p(a+q,b+q,0),p(a,b+q,0)],'#1d4360');
+    }));
+    drawDeparture(corners,p,Math.max(0,(t-demoStart)/1000-.2)%4.5);
+  }
+}
+function cover(){
+  const vw=video.videoWidth,vh=video.videoHeight;
+  const k=Math.max(width/vw,height/vh);
+  return {vw,vh,k,x:(width-vw*k)/2,y:(height-vh*k)/2};
+}
+function detect(t,view){
+  if(t-lastScan<92)return;
+  lastScan=t;
+  const scale=Math.min(1,640/Math.max(view.vw,view.vh));
+  const w=Math.round(view.vw*scale),h=Math.round(view.vh*scale);
+  if(sample.width!==w||sample.height!==h){sample.width=w;sample.height=h;}
+  scan.drawImage(video,0,0,w,h);
+  const img=scan.getImageData(0,0,w,h);
+  const result=window.jsQR(img.data,w,h,{inversionAttempts:'dontInvert'});
+  if(result?.data!==markerPayload)return;
+  const q=result.location;
+  const points=[q.topLeftCorner,q.topRightCorner,q.bottomRightCorner,q.bottomLeftCorner].map(pt=>[
+    pt.x/w*view.vw*view.k+view.x,pt.y/h*view.vh*view.k+view.y
+  ]);
+  const wasLost=t-lastSeen>=trackingGraceMs||!pose;
+  if(wasLost)depart=t;
+  // Smooth small corner variations more strongly while following intentional movement.
+  const movement=wasLost?0:Math.max(...pose.map(([x,y],i)=>Math.hypot(x-points[i][0],y-points[i][1])));
+  const edge=Math.hypot(points[1][0]-points[0][0],points[1][1]-points[0][1]);
+  const follow=mix(.28,.72,smooth(.025,.16,movement/Math.max(1,edge)));
+  pose=wasLost?points:pose.map((pt,i)=>pt.map((value,j)=>mix(value,points[i][j],follow)));
+  lastSeen=t;
+}
+function draw(t){
+  frame=requestAnimationFrame(draw);
+  if(mode==='demo'){demo(t);return;}
+  if(video.readyState<2||!video.videoWidth){
+    ctx.clearRect(0,0,width,height);
+    pose=null;
+    $('#replay').hidden=true;
+    status('カメラ映像を待っています');
+    return;
+  }
+  const view=cover();
+  ctx.drawImage(video,view.x,view.y,view.vw*view.k,view.vh*view.k);
+  try{detect(t,view);}catch(error){
+    console.error('QR detection failed',error);
+    stop();
+    status('QRの読み取り処理でエラーが発生しました。ページを再読み込みしてください');
+    return;
+  }
+  const tracking=pose && t-lastSeen<trackingGraceMs;
+  $('#replay').hidden=!tracking;
+  if(!tracking){pose=null;status('テスト用QRを白い余白まで画面に入れてください');return;}
+  const p=homography(pose);
+  if(!p)return;
+  const elapsed=(t-depart)/1000;
+  status(elapsed<3.55?'モノレールが発車します':'QRを映したまま、もう一度発車できます');
+  if(elapsed<3.55)drawDeparture(pose,p,elapsed);
+}
+
+function stop(){
+  modeRequest++;
+  stream?.getTracks().forEach(track=>track.stop());
+  stream=null;video.srcObject=null;
+  mode='demo';demoStart=performance.now();pose=null;
+  $('#start').disabled=false;$('#start').textContent='ARカメラを開く';$('#replay').hidden=true;
+}
+$('#start').addEventListener('click',async()=>{
+  if(mode==='ar'){stop();status('プレビュー · カメラなしで動きを確認できます');return;}
+  if(!window.isSecureContext){status('カメラを使うにはNetlifyのHTTPS URLをSafariで開いてください');return;}
+  if(!navigator.mediaDevices?.getUserMedia){status('カメラ機能が使えません。iPhoneではサイトをSafariで直接開いてください');return;}
+  if(!window.jsQR){status('QR読み取りライブラリを読み込めませんでした。assetsフォルダごと再アップロードしてください');return;}
+  const request=++modeRequest;
+  $('#start').disabled=true;status('カメラへのアクセスを確認しています');
+  try{
+    const opened=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'},width:{ideal:1280}},audio:false});
+    if(request!==modeRequest){opened.getTracks().forEach(track=>track.stop());return;}
+    stream=opened;video.srcObject=stream;
+    const track=stream.getVideoTracks()[0];
+    track?.addEventListener('ended',()=>{
+      if(request!==modeRequest)return;
+      stop();
+      status('カメラとの接続が切れました。ARカメラを開き直してください');
+    });
+    await video.play();
+    if(request!==modeRequest)return;
+    mode='ar';pose=null;lastSeen=0;lastScan=0;
+    $('#start').disabled=false;$('#start').textContent='カメラを閉じる';
+    status('QRコード全体を画面に入れてください');
+  }catch(error){
+    if(request!==modeRequest)return;
+    stop();
+    if(error.name==='NotAllowedError'||error.name==='SecurityError'){
+      status('カメラが許可されていません。SafariのこのWebサイトの設定でカメラを許可してください');
+    }else if(error.name==='NotFoundError'){
+      status('カメラが見つかりませんでした');
+    }else{
+      status('カメラを起動できませんでした。他のアプリでカメラを使っていないか確認してください');
+    }
+  }
+});
+$('#demo').onclick=()=>{stop();status('プレビュー · カメラなしで動きを確認できます');};
+$('#replay').onclick=()=>{depart=performance.now();};
+window.addEventListener('pagehide',()=>{stop();cancelAnimationFrame(frame);});
+window.addEventListener('pageshow',event=>{if(event.persisted)frame=requestAnimationFrame(draw);});
+const matrix='1111111011010110101111111,1000001000110111001000001,1011101000110010001011101,1011101010111000101011101,1011101011100000001011101,1000001010011000001000001,1111111010101010101111111,0000000010101101100000000,1000101111110100011111001,0010100001110110110111001,0111101101011001001101000,1000110011000010011000011,1111001011110110101000100,1100100101001001100010100,0000111100011111111100100,0011010001110101000011000,1110101100101100111110100,0000000010100111100010110,1111111010000000101010010,1000001000001011100011101,1011101011010111111111000,1011101001101001100100001,1011101001111110100110010,1000001001110101101111111,1111111011101101011101001'.split(',');
+frame=requestAnimationFrame(draw);
+</script>
+</html>
