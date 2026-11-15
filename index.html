@@ -23,6 +23,9 @@ const scan = sample.getContext('2d',{willReadFrequently:true});
 let width, height, stream, mode = 'demo', modeRequest = 0, frame = 0;
 const markerPayload = 'KITAKYUSHU-MONORAIL-AR';
 const trackingGraceMs = 450;
+const departureMs = 3550;
+const departureCycleMs = departureMs + 500;
+const departurePhase = (now, start) => Math.max(0, now-start) % departureCycleMs;
 let pose, lastSeen = 0, lastScan = 0, depart = 0, demoStart = performance.now();
 const status = message => { if ($('#status').textContent !== message) $('#status').textContent = message; };
 const clamp = (v,a,b) => Math.max(a,Math.min(b,v));
@@ -97,7 +100,7 @@ function drawDeparture(corners,markerProject,time){
   const cos=dx/edge,sin=dy/edge;
   const screen=([x,y])=>[center[0]+size*(x*cos-y*sin),center[1]+size*(x*sin+y*cos)];
   const draw=(points,color)=>polygon(points.map(screen),color);
-  const progress=clamp(time/3.55,0,1);
+  const progress=clamp(time/(departureMs/1000),0,1);
   const lead=mix(carPitch*3+.11,trackLength-.14,progress*(.56+.44*progress));
   ctx.save();
   ctx.globalAlpha=1-smooth(.90,1,progress);
@@ -164,7 +167,8 @@ function demo(t){
       const n=matrix.length,a=(ix+2)/(n+4),b=(iy+2)/(n+4),q=1/(n+4);
       polygon([p(a,b,0),p(a+q,b,0),p(a+q,b+q,0),p(a,b+q,0)],'#1d4360');
     }));
-    drawDeparture(corners,p,Math.max(0,(t-demoStart)/1000-.2)%4.5);
+    const phase=departurePhase(t,demoStart);
+    if(phase<departureMs)drawDeparture(corners,p,phase/1000);
   }
 }
 function cover(){
@@ -218,9 +222,9 @@ function draw(t){
   if(!tracking){pose=null;status('テスト用QRを白い余白まで画面に入れてください');return;}
   const p=homography(pose);
   if(!p)return;
-  const elapsed=(t-depart)/1000;
-  status(elapsed<3.55?'モノレールが発車します':'QRを映したまま、もう一度発車できます');
-  if(elapsed<3.55)drawDeparture(pose,p,elapsed);
+  const phase=departurePhase(t,depart);
+  status(phase<departureMs?'モノレールが発車します':'まもなく再発車します');
+  if(phase<departureMs)drawDeparture(pose,p,phase/1000);
 }
 
 function stop(){
