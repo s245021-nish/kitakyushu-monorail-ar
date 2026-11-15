@@ -5,11 +5,12 @@
 <title>北九州モノレール AR</title>
 <style>
 :root{font-family:system-ui,sans-serif;color:#eef8ff;background:#081a2c;color-scheme:dark}*{box-sizing:border-box}body{margin:0}main{max-width:960px;margin:auto;padding:clamp(18px,4vw,42px)}header{display:flex;align-items:center;gap:13px;margin-bottom:20px}.icon{display:grid;place-items:center;width:46px;height:46px;border-radius:12px;background:#b9eaff;color:#103963;font-size:25px}h1{font-size:clamp(24px,5vw,38px);letter-spacing:-.04em;margin:0}.stage{position:relative;overflow:hidden;border-radius:20px;background:#153953;aspect-ratio:16/10;border:1px solid #39617a}video,canvas{position:absolute;width:100%;height:100%;object-fit:cover;inset:0}video{visibility:hidden}#status{position:absolute;bottom:12px;left:12px;right:12px;margin:0;padding:9px 13px;border-radius:11px;background:#071b2de8;font-size:14px;width:fit-content;max-width:calc(100% - 24px)}.actions{display:flex;flex-wrap:wrap;gap:8px;margin:14px 0}button,a.action{border:1px solid #537e9c;background:#193954;border-radius:10px;padding:10px 15px;font:inherit;color:inherit;text-decoration:none;cursor:pointer}button.primary{background:#a8e5ff;color:#09243b;border-color:transparent;font-weight:700}button:disabled{opacity:.5;cursor:default}details{border-top:1px solid #31536b;padding:14px 0;color:#c2d7e8}summary{cursor:pointer}p{line-height:1.65}#marker{position:static;display:block;width:min(330px,100%);height:auto;aspect-ratio:1;background:white;image-rendering:pixelated;margin:14px 0}[hidden]{display:none!important}@media(max-width:530px){.stage{aspect-ratio:4/5}}
+#version{position:absolute;right:10px;top:10px;padding:4px 7px;border-radius:6px;background:#081a2cee;color:#e1f4ff;font-size:11px;pointer-events:none}
 @media print{body{background:white;color:black}header,.stage,.actions,summary,details p,details a{display:none}#marker{width:75mm;height:75mm}}
 </style>
 <main>
 <header><span class="icon" aria-hidden="true">🚝</span><h1>北九州モノレール AR</h1></header>
-<section class="stage" aria-label="AR表示"><video playsinline muted></video><canvas id="scene"></canvas><p id="status" role="status" aria-live="polite">プレビュー · カメラなしで動きを確認できます</p></section>
+<section class="stage" aria-label="AR表示"><video playsinline muted></video><canvas id="scene"></canvas><small id="version">AR v4 · CURVE</small><p id="status" role="status" aria-live="polite">プレビュー · カメラなしで動きを確認できます</p></section>
 <div class="actions"><button class="primary" id="start">ARカメラを開く</button><button id="demo">プレビューを再生</button><button id="replay" hidden>もう一度発車</button></div>
 <details id="markerDetails"><summary>テスト用QRマーカーを表示</summary><p>PCでこのQRを表示し、iPhoneのSafariで同じサイトを開いて「ARカメラを開く」を押してください。白い余白までカメラに映します。</p><img id="marker" src="assets/monorail-ar-marker.png" width="528" height="528" alt="北九州モノレールAR用の白黒QRコード"><a class="action" id="save" href="assets/monorail-ar-marker.png" download="monorail-ar-marker.png">QR画像を保存</a></details>
 </main>
@@ -44,10 +45,6 @@ function polygon(points, fill, stroke){
   ctx.fillStyle=fill;ctx.fill();
   if(stroke){ctx.strokeStyle=stroke;ctx.lineWidth=1;ctx.stroke();}
 }
-function line(a,b,color,size){
-  if(!a||!b)return;
-  ctx.beginPath();ctx.moveTo(...a);ctx.lineTo(...b);ctx.strokeStyle=color;ctx.lineWidth=size;ctx.stroke();
-}
 function homography(corners){
   const [[x0,y0],[x1,y1],[x2,y2],[x3,y3]]=corners;
   const dx1=x1-x2, dx2=x3-x2, dx3=x0-x1+x2-x3;
@@ -56,86 +53,98 @@ function homography(corners){
   if(Math.abs(det)<1)return;
   const g=(dx3*dy2-dx2*dy3)/det, h=(dx1*dy3-dx3*dy1)/det;
   const a=x1-x0+g*x1,b=x3-x0+h*x3,d=y1-y0+g*y1,e=y3-y0+h*y3;
-  const ox=width/2,oy=height/2,f=Math.max(width,height)*.93;
-  const u=[(a-ox*g)/f,(d-oy*g)/f,g],v=[(b-ox*h)/f,(e-oy*h)/f,h];
-  const scale=(Math.hypot(...u)+Math.hypot(...v))/2;
-  let n=[u[1]*v[2]-u[2]*v[1],u[2]*v[0]-u[0]*v[2],u[0]*v[1]-u[1]*v[0]];
-  const length=Math.hypot(...n);
-  if(length<1e-7)return;
-  if(n[2]<0)n=n.map(x=>-x);
-  n=n.map(x=>x/length*scale);
-  const project=(x,y,z)=>{
-    const depth=1+g*x+h*y-n[2]*z;
+  return (x,y)=>{
+    const depth=1+g*x+h*y;
     if(depth<.16)return null;
-    return [(a*x+b*y+x0-(f*n[0]+ox*n[2])*z)/depth,(d*x+e*y+y0-(f*n[1]+oy*n[2])*z)/depth];
+    return [(a*x+b*y+x0)/depth,(d*x+e*y+y0)/depth];
   };
-  project.depth=(x,y,z)=>1+g*x+h*y-n[2]*z;
-  return project;
 }
 
-function train(project,time){
+// Coordinates are relative to the QR's center. A shared presentation projection
+// keeps the broad side and navy beam visible even with a head-on camera.
+const trackControls=[[1.09,-.55],[.66,.025],[-.12,.19],[-1.19,.47]];
+const trackSamples=[];
+const carPitch=.30;
+for(let i=0;i<=96;i++){
+  const t=i/96, u=1-t;
+  const weights=[u*u*u,3*u*u*t,3*u*t*t,t*t*t];
+  const point=[0,1].map(axis=>trackControls.reduce((sum,p,j)=>sum+p[axis]*weights[j],0));
+  const scale=.48+.92*t*t;
+  const last=trackSamples[i-1];
+  const distance=last?last.distance+Math.hypot(point[0]-last.x,point[1]-last.y)/((scale+last.scale)/2):0;
+  trackSamples.push({x:point[0],y:point[1],scale,distance});
+}
+const trackLength=trackSamples.at(-1).distance;
+
+function sampleTrack(distance){
+  let index=1;
+  while(index<trackSamples.length-1&&trackSamples[index].distance<distance)index++;
+  const a=trackSamples[index-1],b=trackSamples[index];
+  const t=clamp((distance-a.distance)/(b.distance-a.distance),0,1);
+  return {x:mix(a.x,b.x,t),y:mix(a.y,b.y,t),scale:mix(a.scale,b.scale,t)};
+}
+
+function drawDeparture(corners,markerProject,time){
+  const center=markerProject(.5,.5);
+  if(!center)return;
+  const [tl,tr,br,bl]=corners;
+  const dx=(tr[0]-tl[0]+br[0]-bl[0])/2;
+  const dy=(tr[1]-tl[1]+br[1]-bl[1])/2;
+  const edge=Math.hypot(dx,dy);
+  if(edge<1)return;
+  const vertical=(Math.hypot(bl[0]-tl[0],bl[1]-tl[1])+Math.hypot(br[0]-tr[0],br[1]-tr[1]))/2;
+  const size=Math.min(Math.sqrt(edge*vertical)*1.08,width*.37,height*.44);
+  const cos=dx/edge,sin=dy/edge;
+  const screen=([x,y])=>[center[0]+size*(x*cos-y*sin),center[1]+size*(x*sin+y*cos)];
+  const draw=(points,color)=>polygon(points.map(screen),color);
   const progress=clamp(time/3.55,0,1);
-  const nose=-.52+2.47*progress;
-  const travel=progress>.18?smooth(.18,.72,progress):0;
-  const fade=1-smooth(.81,1,progress);
-  const y=.52, railZ=.075, h=.21, w=.27, carLength=.45;
-  const faces=[];
-  function face(vertices,color,outline){
-    const points=vertices.map(v=>project(...v));
-    const depth=vertices.reduce((sum,v)=>sum+project.depth(...v),0)/vertices.length;
-    faces.push({points,color,outline,depth});
-  }
-  function prism(x0,x1,y0,y1,z0,z1,colors){
-    face([[x0,y0,z0],[x1,y0,z0],[x1,y0,z1],[x0,y0,z1]],colors[0]);
-    face([[x0,y1,z0],[x1,y1,z0],[x1,y1,z1],[x0,y1,z1]],colors[1]);
-    face([[x0,y0,z1],[x1,y0,z1],[x1,y1,z1],[x0,y1,z1]],colors[2]);
-    face([[x1,y0,z0],[x1,y1,z0],[x1,y1,z1],[x1,y0,z1]],colors[3]);
-  }
-  const incline=x=>.29*smooth(.03,1.33,x);
-  const yTrack=x=>y+.3*smooth(.05,1.7,x);
-  function rail(x0,x1){
-    const z0=railZ+incline(x0),z1=railZ+incline(x1);
-    const a=yTrack(x0),b=yTrack(x1);
-    face([[x0,a-.056,z0],[x1,b-.056,z1],[x1,b+.056,z1],[x0,a+.056,z0]],'#acc1cf');
-    face([[x0,a+.056,z0-.065],[x1,b+.056,z1-.065],[x1,b+.056,z1],[x0,a+.056,z0]],'#506c83');
-  }
-  ctx.save();ctx.globalAlpha=fade;
-  for(let i=0;i<15;i++){const x=-.48+i*.17;rail(x,x+.171);}
-  const frontPoint=project(nose,yTrack(nose),railZ+incline(nose)+h*.51);
-  if(frontPoint){
-    const glow=ctx.createRadialGradient(...frontPoint,0,...frontPoint,width*.14);
-    glow.addColorStop(0,'#74e4ff66');glow.addColorStop(1,'#74e4ff00');
-    ctx.fillStyle=glow;ctx.fillRect(0,0,width,height);
-  }
-  for(let j=0;j<4;j++){
-    const x1=nose-j*(carLength+.034), x0=x1-carLength;
-    const yMid=yTrack((x1+x0)/2), z=railZ+incline((x1+x0)/2), yl=yMid-w/2,yr=yMid+w/2;
-    prism(x0,x1,yl,yr,z,z+h,['#d6e4e6','#f3f2e5','#f8fbf6','#d9e9eb']);
-    const visibleSide=project.depth(x0,yl,z)<project.depth(x0,yr,z)?yl:yr;
-    const side=visibleSide===yl?yl-.003:yr+.003;
-    const sideQuad=(a,b,low,high,fill)=>face([[a,side,z+low],[b,side,z+low],[b,side,z+high],[a,side,z+high]],fill);
-    sideQuad(x0+.005,x1-.005,.03,.081,'#1075bd');
-    for(let i=0;i<4;i++){
-      const x=x0+.028+i*.10;
-      sideQuad(x,x+.071,.114,.177,'#153b56');
-      sideQuad(x+.007,x+.062,.159,.171,'#467a95');
+  const lead=mix(carPitch*3+.11,trackLength-.14,progress*(.56+.44*progress));
+  ctx.save();
+  ctx.globalAlpha=1-smooth(.90,1,progress);
+  const edgeAt=(p,offset)=>[p.x,p.y+offset*p.scale];
+  draw([...trackSamples.map(p=>edgeAt(p,-.028)),...trackSamples.slice().reverse().map(p=>edgeAt(p,.027))],'#466579');
+  draw([...trackSamples.map(p=>edgeAt(p,.027)),...trackSamples.slice().reverse().map(p=>edgeAt(p,.133))],'#142e40');
+  draw([...trackSamples.map(p=>edgeAt(p,.028)),...trackSamples.slice().reverse().map(p=>edgeAt(p,.043))],'#274d63');
+
+  for(let car=3;car>=0;car--){
+    const distance=lead-car*carPitch;
+    const rear=sampleTrack(distance-.132);
+    const front=sampleTrack(distance+.132);
+    const center=sampleTrack(distance);
+    const height=center.scale*.38;
+    // The body axis follows the chord between its two bogies. The front fascia
+    // uses a short screen-space rim to preserve its silhouette at small sizes.
+    const side=(along,up)=>[mix(rear.x,front.x,along),mix(rear.y,front.y,along)-up*height];
+    const shape=(points,color)=>draw(points.map(([a,b])=>side(a,b)),color);
+    const panel=(a,b,low,high,color)=>shape([[a,low],[b,low],[b,high],[a,high]],color);
+    const rim=(point)=>[point[0]-.047*front.scale,point[1]-.035*front.scale];
+    const roofRear=side(.025,1),roofFront=side(.962,1);
+    if(car>0){
+      const coupled=sampleTrack(distance+carPitch-.134);
+      draw([[front.x,front.y-.031],[coupled.x,coupled.y-.031],[coupled.x,coupled.y-.005],[front.x,front.y-.005]],'#132834');
     }
-    if(!j && project.depth(x1,yMid,z)<project.depth(x0,yMid,z)){
-      const front=(a,b,low,high,color)=>face([[x1+.005,a,z+low],[x1+.005,b,z+low],[x1+.005,b,z+high],[x1+.005,a,z+high]],color);
-      front(yl+.019,yr-.019,.1,.184,'#183c55');
-      front(yl+.028,yr-.028,.159,.176,'#426c88');
-      front(yl,yr,.029,.079,'#157bc3');
-      front(yl+.021,yl+.064,.049,.069,'#ecffff');
-      front(yr-.064,yr-.021,.049,.069,'#ecffff');
+    draw([roofRear,roofFront,rim(roofFront),rim(roofRear)],'#b3c5ca');
+    shape([[0,.12],[.04,0],[.91,0],[1,.12],[1,.89],[.962,1],[.025,1],[0,.88]],'#f3e9cf');
+    panel(.015,.98,.11,.37,'#0769b6');
+    panel(.025,.97,.08,.115,'#9dafb5');
+    panel(.025,.97,.365,.405,'#eaf2ed');
+    for(let window=0;window<3;window++){
+      const x=.06+window*.31;
+      panel(x,x+.264,.48,.84,'#102d40');
+      panel(x+.012,x+.25,.785,.823,'#426779');
     }
-  }
-  faces.sort((a,b)=>b.depth-a.depth);
-  faces.forEach(f=>polygon(f.points,f.color,f.outline));
-  if(travel>.1 && travel<1 && frontPoint){
-    ctx.globalAlpha=fade*(1-travel)*.7;
-    for(let i=0;i<8;i++){
-      const yy=y-.30+i*.09;
-      line(project(nose-.52,yy,.20),project(nose-.25,yy,.25),'#9eeaff',Math.max(1,width*.002));
+    if(car===0){
+      const nose=(across,up)=>{
+        const p=side(1,up);
+        const outer=rim(p);
+        return [mix(p[0],outer[0],across),mix(p[1],outer[1],across)];
+      };
+      const cab=(a,b,low,high,color)=>draw([nose(a,low),nose(b,low),nose(b,high),nose(a,high)],color);
+      cab(0,1,.12,.90,'#dddbc8');
+      cab(.08,.93,.48,.85,'#102b3c');
+      cab(0,1,.14,.38,'#075eaa');
+      cab(.10,.33,.21,.30,'#fff9d2');
+      cab(.66,.89,.21,.30,'#fff9d2');
     }
   }
   ctx.restore();
@@ -155,7 +164,7 @@ function demo(t){
       const n=matrix.length,a=(ix+2)/(n+4),b=(iy+2)/(n+4),q=1/(n+4);
       polygon([p(a,b,0),p(a+q,b,0),p(a+q,b+q,0),p(a,b+q,0)],'#1d4360');
     }));
-    train(p,Math.max(0,(t-demoStart)/1000-.2)%4.5);
+    drawDeparture(corners,p,Math.max(0,(t-demoStart)/1000-.2)%4.5);
   }
 }
 function cover(){
@@ -179,7 +188,11 @@ function detect(t,view){
   ]);
   const wasLost=t-lastSeen>=trackingGraceMs||!pose;
   if(wasLost)depart=t;
-  pose=wasLost?points:pose.map((pt,i)=>pt.map((value,j)=>mix(value,points[i][j],.52)));
+  // Smooth small corner variations more strongly while following intentional movement.
+  const movement=wasLost?0:Math.max(...pose.map(([x,y],i)=>Math.hypot(x-points[i][0],y-points[i][1])));
+  const edge=Math.hypot(points[1][0]-points[0][0],points[1][1]-points[0][1]);
+  const follow=mix(.28,.72,smooth(.025,.16,movement/Math.max(1,edge)));
+  pose=wasLost?points:pose.map((pt,i)=>pt.map((value,j)=>mix(value,points[i][j],follow)));
   lastSeen=t;
 }
 function draw(t){
@@ -207,7 +220,7 @@ function draw(t){
   if(!p)return;
   const elapsed=(t-depart)/1000;
   status(elapsed<3.55?'モノレールが発車します':'QRを映したまま、もう一度発車できます');
-  if(elapsed<3.55)train(p,elapsed);
+  if(elapsed<3.55)drawDeparture(pose,p,elapsed);
 }
 
 function stop(){
